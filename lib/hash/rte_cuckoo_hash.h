@@ -231,6 +231,7 @@ struct rte_hash {
 	uint32_t *ext_bkt_to_free;
 	uint32_t *tbl_chng_cnt;
 	/**< Indicates if the hash table changed from last read. */
+	uint32_t *secondary_count;
 } __rte_cache_aligned;
 
 struct queue_node {

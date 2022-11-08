@@ -156,6 +156,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	unsigned int no_free_on_del = 0;
 	uint32_t *ext_bkt_to_free = NULL;
 	uint32_t *tbl_chng_cnt = NULL;
+	uint32_t *secondary_count = NULL;
 	struct lcore_cache *local_free_slots = NULL;
 	unsigned int readwrite_concur_lf_support = 0;
 	uint32_t i;
@@ -347,8 +348,16 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	tbl_chng_cnt = rte_zmalloc_socket(NULL, sizeof(uint32_t),
 			RTE_CACHE_LINE_SIZE, params->socket_id);
 
+	secondary_count = rte_zmalloc_socket(NULL, sizeof(uint32_t),
+			RTE_CACHE_LINE_SIZE, params->socket_id);
+
 	if (tbl_chng_cnt == NULL) {
 		RTE_LOG(ERR, HASH, "memory allocation failed\n");
+		goto err_unlock;
+	}
+
+	if (secondary_count == NULL) {
+		RTE_LOG(ERR, HASH, "memory allocation failed for secondary count\n");
 		goto err_unlock;
 	}
 
@@ -415,6 +424,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	h->key_entry_size = key_entry_size;
 	h->hash_func_init_val = params->hash_func_init_val;
 
+	h->secondary_count = 0;
 	h->num_buckets = num_buckets;
 	h->bucket_bitmask = h->num_buckets - 1;
 	h->buckets = buckets;
@@ -426,6 +436,7 @@ rte_hash_create(const struct rte_hash_parameters *params)
 	h->free_slots = r;
 	h->ext_bkt_to_free = ext_bkt_to_free;
 	h->tbl_chng_cnt = tbl_chng_cnt;
+	h->secondary_count = secondary_count;
 	*h->tbl_chng_cnt = 0;
 	h->hw_trans_mem_support = hw_trans_mem_support;
 	h->use_local_cache = use_local_cache;
@@ -481,6 +492,7 @@ err:
 	rte_free(buckets_ext);
 	rte_free(k);
 	rte_free(tbl_chng_cnt);
+	rte_free(secondary_count);
 	rte_free(ext_bkt_to_free);
 	return NULL;
 }
@@ -527,6 +539,7 @@ rte_hash_free(struct rte_hash *h)
 	rte_free(h->buckets_ext);
 	rte_free(h->tbl_chng_cnt);
 	rte_free(h->ext_bkt_to_free);
+	rte_free(h->secondary_count);
 	rte_free(h);
 	rte_free(te);
 }
@@ -575,6 +588,15 @@ rte_hash_count(const struct rte_hash *h)
 		ret = tot_ring_cnt - rte_ring_count(h->free_slots);
 	}
 	return ret;
+}
+
+int32_t
+rte_hash_secondary_count(const struct rte_hash *h)
+{
+	if (h == NULL)
+		return -EINVAL;
+
+	return *h->secondary_count;
 }
 
 /* Read write locks implemented using rte_rwlock */
@@ -1088,7 +1110,9 @@ __rte_hash_add_key_with_hash(const struct rte_hash *h, const void *key,
 		enqueue_slot_back(h, cached_free_slots, slot_id);
 		return ret_val;
 	}
-
+	
+//	*h->secondary_count = *h->seconadry_count + 1;
+	__atomic_store_n(h->secondary_count, *h->secondary_count + 1, __ATOMIC_RELEASE);
 	/* Primary bucket full, need to make space for new entry */
 	ret = rte_hash_cuckoo_make_space_mw(h, prim_bkt, sec_bkt, key, data,
 				short_sig, prim_bucket_idx, slot_id, &ret_val);
@@ -1319,11 +1343,9 @@ __rte_hash_lookup_with_hash_l(const struct rte_hash *h, const void *key,
 	struct rte_hash_bucket *bkt, *cur_bkt;
 	int ret;
 	uint16_t short_sig;
-
 	short_sig = get_short_sig(sig);
 	prim_bucket_idx = get_prim_bucket_index(h, sig);
 	sec_bucket_idx = get_alt_bucket_index(h, prim_bucket_idx, short_sig);
-
 	bkt = &h->buckets[prim_bucket_idx];
 
 	__hash_rw_reader_lock(h);
@@ -1433,6 +1455,91 @@ rte_hash_lookup(const struct rte_hash *h, const void *key)
 	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
 	return __rte_hash_lookup_with_hash(h, key, rte_hash_hash(h, key), NULL);
 }
+
+int32_t
+rte_hash_prefetch_bucket(const struct rte_hash *h, const void *bucket)
+{
+	
+	struct rte_hash_bucket *bkt;
+	bkt = (struct rte_hash_bucket *) bucket;
+	struct rte_hash_key *k, *keys = h->key_store;
+	k = (struct rte_hash_key *) ((char *)keys + bkt->key_idx[0] * h->key_entry_size);
+	rte_prefetch0(k);
+
+	return 1;
+}
+
+void *
+rte_hash_prefetch(const struct rte_hash *h, const void *key, bool secondary, int lvl)
+{                                                                                                                                                                                                         
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);                                                                                                                                           
+	                                                                                                                                                     
+	uint32_t prim_bucket_idx, sec_bucket_idx;
+	struct rte_hash_bucket *bkt, *sec_bkt;
+	uint16_t short_sig;                 
+	hash_sig_t sig;                                                                                                                                                                                    
+	                                                                                                                                                          
+	sig = rte_hash_hash(h, key);                                                                                                                                                                       
+	short_sig = get_short_sig(sig);
+	prim_bucket_idx = get_prim_bucket_index(h, sig);                                                                                                                                                   
+
+	bkt = &h->buckets[prim_bucket_idx];
+	// Prefetch the primary bucket only!
+	if (lvl == 1)
+		rte_prefetch1(bkt);
+	else if (lvl == 2)
+		rte_prefetch2(bkt);
+	else if (lvl == 3)
+		rte_prefetch_non_temporal(bkt);
+	else
+		rte_prefetch0(bkt);
+
+	if (secondary){
+		sec_bucket_idx = get_alt_bucket_index(h, prim_bucket_idx, short_sig);
+		sec_bkt = &h->buckets[sec_bucket_idx];
+		if (lvl == 1)
+			rte_prefetch1(sec_bkt);
+		else if (lvl == 2)
+			rte_prefetch2(sec_bkt);
+		else if (lvl == 3)
+			rte_prefetch_non_temporal(sec_bkt);
+		else
+			rte_prefetch0(sec_bkt);
+	}
+
+	return bkt;
+}
+
+int32_t
+rte_hash_prefetch_slot(const struct rte_hash *h, const void *key)
+{
+	RETURN_IF_TRUE(((h == NULL) || (key == NULL)), -EINVAL);
+
+        uint32_t prim_bucket_idx;
+        struct rte_hash_bucket *bkt;
+        uint16_t short_sig;
+        hash_sig_t sig;
+
+        sig = rte_hash_hash(h, key);
+        short_sig = get_short_sig(sig);
+        prim_bucket_idx = get_prim_bucket_index(h, sig);
+
+        bkt = &h->buckets[prim_bucket_idx];
+
+        int i;
+        struct rte_hash_key *k, *keys = h->key_store;
+
+        for (i =0; i< RTE_HASH_BUCKET_ENTRIES; i++) {
+        	if (bkt->sig_current[i] == sig && bkt->key_idx[i] != EMPTY_SLOT){
+		       k = (struct rte_hash_key *) ((char *)keys + 
+				       bkt->key_idx[i] * h->key_entry_size);
+		       rte_prefetch0(k);
+        	}
+	}
+
+        return 1;
+}
+
 
 int
 rte_hash_lookup_with_hash_data(const struct rte_hash *h,

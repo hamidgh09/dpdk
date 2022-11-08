@@ -204,6 +204,9 @@ rte_hash_reset(struct rte_hash *h);
 int32_t
 rte_hash_count(const struct rte_hash *h);
 
+int32_t
+rte_hash_secondary_count(const struct rte_hash *h);
+
 /**
  * Return the maximum key value ID that could possibly be returned by
  * rte_hash_add_key function.
@@ -517,6 +520,20 @@ rte_hash_lookup(const struct rte_hash *h, const void *key);
 int32_t
 rte_hash_lookup_with_hash(const struct rte_hash *h,
 				const void *key, hash_sig_t sig);
+
+/**
+ *  * Prefetch a key from the hash table! 
+ *   * Use this if you know in a near future you will need the data!
+ *    */
+void *
+rte_hash_prefetch(const struct rte_hash *h, const void *key, bool secondary, int lvl);
+
+
+int32_t
+rte_hash_prefetch_slot(const struct rte_hash *h, const void *key);
+
+int32_t
+rte_hash_prefetch_bucket(const struct rte_hash *h, const void *key);
 
 /**
  * Calc a hash value by key.

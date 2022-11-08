@@ -27,6 +27,8 @@ extern "C" {
 #include <rte_config.h>
 #include <rte_hash_crc.h>
 #include <rte_jhash.h>
+#include <rte_log.h>
+#include <rte_prefetch.h>
 
 #ifndef RTE_FBK_HASH_INIT_VAL_DEFAULT
 /** Initialising value used when calculating hash. */
@@ -34,16 +36,29 @@ extern "C" {
 #endif
 
 /** The maximum number of entries in the hash table that is supported. */
-#define RTE_FBK_HASH_ENTRIES_MAX		(1 << 20)
+#define RTE_FBK_HASH_ENTRIES_MAX		(1 << 31)
 
 /** The maximum number of entries in each bucket that is supported. */
-#define RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX	256
+#define RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX	8
 
 /** Maximum size of string for naming the hash. */
 #define RTE_FBK_HASH_NAMESIZE			32
 
+struct rte_fbk_key {
+        union{
+	        struct {
+                uint64_t a;
+                uint64_t b;
+        };
+        __m128i mm;
+        };
+};
+
+// typedef struct rte_fbk_key_struct rte_fbk_key;
+
 /** Type of function that can be used for calculating the hash value. */
-typedef uint32_t (*rte_fbk_hash_fn)(uint32_t key, uint32_t init_val);
+typedef uint32_t (*rte_fbk_hash_fn)(const struct rte_fbk_key key, uint32_t init_val);
+
 
 /** Parameters used when creating four-byte key hash table. */
 struct rte_fbk_hash_params {
@@ -54,6 +69,15 @@ struct rte_fbk_hash_params {
 	rte_fbk_hash_fn hash_func;	/**< The hash function. */
 	uint32_t init_val;		/**< For initialising hash function. */
 };
+
+struct rte_fbk_bucket {
+	uint8_t occupied[RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX];
+	struct rte_fbk_key key[RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX];
+	uint64_t value[RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX];
+} __rte_cache_aligned;
+
+// typedef struct rte_fbk_bucket_struct rte_fbk_bucket;
+
 
 /** Individual entry in the four-byte key hash table. */
 union rte_fbk_hash_entry {
@@ -78,8 +102,15 @@ struct rte_fbk_hash_table {
 	uint32_t init_val;		/**< For initialising hash function. */
 
 	/** A flat table of all buckets. */
-	union rte_fbk_hash_entry t[];
+	struct rte_fbk_bucket *buckets;
 };
+
+
+static inline int
+cmp_keys_equal(const struct rte_fbk_key key1, const struct rte_fbk_key key2)
+{
+	return key1.a == key2.a && key1.b == key2.b;
+}
 
 /**
  * Find the offset into hash table of the bucket containing a particular key.
@@ -92,10 +123,15 @@ struct rte_fbk_hash_table {
  *   Offset into hash table.
  */
 static inline uint32_t
-rte_fbk_hash_get_bucket(const struct rte_fbk_hash_table *ht, uint32_t key)
+rte_fbk_hash_get_bucket(const struct rte_fbk_hash_table *ht, const struct rte_fbk_key key)
 {
-	return (ht->hash_func(key, ht->init_val) & ht->bucket_mask) <<
-			ht->bucket_shift;
+	return (ht->hash_func(key, ht->init_val) & ht->bucket_mask);
+}
+
+static inline uint32_t
+rte_fbk_hash_get_bucket_with_hash(const struct rte_fbk_hash_table *ht, const uint32_t hash)
+{
+	return (hash & ht->bucket_mask);
 }
 
 /**
@@ -114,9 +150,9 @@ rte_fbk_hash_get_bucket(const struct rte_fbk_hash_table *ht, uint32_t key)
  * @return
  *   0 if ok, or negative value on error.
  */
-static inline int
+static inline uint32_t
 rte_fbk_hash_add_key_with_bucket(struct rte_fbk_hash_table *ht,
-			uint32_t key, uint16_t value, uint32_t bucket)
+			struct rte_fbk_key key, uint64_t value, uint32_t bucket_id)
 {
 	/*
 	 * The writing of a new value to the hash table is done as a single
@@ -124,22 +160,23 @@ rte_fbk_hash_add_key_with_bucket(struct rte_fbk_hash_table *ht,
 	 * corrupted due to race conditions, but it's still possible to
 	 * overwrite entries that have just been made valid.
 	 */
-	const uint64_t new_entry = ((uint64_t)(key) << 32) |
-			((uint64_t)(value) << 16) |
-			1;  /* 1 = is_entry bit. */
+	struct rte_fbk_bucket *bkt;
 	uint32_t i;
-
+	
+	bkt = &ht->buckets[bucket_id];
 	for (i = 0; i < ht->entries_per_bucket; i++) {
 		/* Set entry if unused. */
-		if (! ht->t[bucket + i].entry.is_entry) {
-			ht->t[bucket + i].whole_entry = new_entry;
+		if (bkt->occupied[i] == 0) {
+			bkt->key[i] = key;
+			bkt->value[i] = value;
+			bkt->occupied[i] = 1;
 			ht->used_entries++;
-			return 0;
+			return bucket_id;
 		}
 		/* Change value if key already exists. */
-		if (ht->t[bucket + i].entry.key == key) {
-			ht->t[bucket + i].entry.value = value;
-			return 0;
+		else if (cmp_keys_equal(bkt->key[i], key)){
+			bkt->value[i] = value;
+			return bucket_id;
 		}
 	}
 
@@ -161,10 +198,18 @@ rte_fbk_hash_add_key_with_bucket(struct rte_fbk_hash_table *ht,
  */
 static inline int
 rte_fbk_hash_add_key(struct rte_fbk_hash_table *ht,
-			uint32_t key, uint16_t value)
+			struct rte_fbk_key key, uint16_t value)
 {
 	return rte_fbk_hash_add_key_with_bucket(ht,
 				key, value, rte_fbk_hash_get_bucket(ht, key));
+}
+
+static inline int
+rte_fbk_hash_add_key_with_hash(struct rte_fbk_hash_table *ht,
+			struct rte_fbk_key key, uint64_t value, uint32_t hash)
+{
+	return rte_fbk_hash_add_key_with_bucket(ht,
+				key, value, rte_fbk_hash_get_bucket_with_hash(ht, hash));
 }
 
 /**
@@ -184,31 +229,31 @@ rte_fbk_hash_add_key(struct rte_fbk_hash_table *ht,
 static inline int
 rte_fbk_hash_delete_key_with_bucket(struct rte_fbk_hash_table *ht,
 					uint32_t key, uint32_t bucket)
-{
-	uint32_t last_entry = ht->entries_per_bucket - 1;
-	uint32_t i, j;
+{	
+//	uint32_t last_entry = ht->entries_per_bucket - 1;
+//	uint32_t i, j;
 
-	for (i = 0; i < ht->entries_per_bucket; i++) {
-		if (ht->t[bucket + i].entry.key == key) {
+//	for (i = 0; i < ht->entries_per_bucket; i++) {
+//		if (ht->t[bucket + i].entry.key == key) {
 			/* Find last key in bucket. */
-			for (j = ht->entries_per_bucket - 1; j > i; j-- ) {
-				if (! ht->t[bucket + j].entry.is_entry) {
-					last_entry = j - 1;
-				}
-			}
+//			for (j = ht->entries_per_bucket - 1; j > i; j-- ) {
+//				if (! ht->t[bucket + j].entry.is_entry) {
+//					last_entry = j - 1;
+//				}
+//			}
 			/*
 			 * Move the last key to the deleted key's position, and
 			 * delete the last key. lastEntry and i may be same but
 			 * it doesn't matter.
 			 */
-			ht->t[bucket + i].whole_entry =
-					ht->t[bucket + last_entry].whole_entry;
-			ht->t[bucket + last_entry].whole_entry = 0;
+//			ht->t[bucket + i].whole_entry =
+//					ht->t[bucket + last_entry].whole_entry;
+//			ht->t[bucket + last_entry].whole_entry = 0;
 
-			ht->used_entries--;
-			return 0;
-		}
-	}
+//			ht->used_entries--;
+//			return 0;
+//		}
+//	}
 
 	return -ENOENT; /* Key didn't exist. */
 }
@@ -227,8 +272,9 @@ rte_fbk_hash_delete_key_with_bucket(struct rte_fbk_hash_table *ht,
 static inline int
 rte_fbk_hash_delete_key(struct rte_fbk_hash_table *ht, uint32_t key)
 {
-	return rte_fbk_hash_delete_key_with_bucket(ht,
-				key, rte_fbk_hash_get_bucket(ht, key));
+//	return rte_fbk_hash_delete_key_with_bucket(ht,
+//				key, rte_fbk_hash_get_bucket(ht, key));
+	return -ENOENT;
 }
 
 /**
@@ -246,22 +292,24 @@ rte_fbk_hash_delete_key(struct rte_fbk_hash_table *ht, uint32_t key)
  */
 static inline int
 rte_fbk_hash_lookup_with_bucket(const struct rte_fbk_hash_table *ht,
-				uint32_t key, uint32_t bucket)
+				struct rte_fbk_key key, uint32_t bucket_id, uint64_t *value)
 {
-	union rte_fbk_hash_entry current_entry;
+	struct rte_fbk_bucket *bkt;
+
+	bkt = &ht->buckets[bucket_id];
 	uint32_t i;
 
 	for (i = 0; i < ht->entries_per_bucket; i++) {
 		/* Single read of entry, which should be atomic. */
-		current_entry.whole_entry = ht->t[bucket + i].whole_entry;
-		if (! current_entry.entry.is_entry) {
-			return -ENOENT; /* Error once we hit an empty field. */
-		}
-		if (current_entry.entry.key == key) {
-			return current_entry.entry.value;
+		if (bkt->occupied[i] == 0)
+			return -ENOENT;
+		if (cmp_keys_equal(bkt->key[i], key)) {
+			*value = bkt->value[i];
+			return bucket_id;
 		}
 	}
-	return -ENOENT; /* Key didn't exist. */
+	return -ENOENT; 
+	/* Key didn't exist. */
 }
 
 /**
@@ -274,11 +322,28 @@ rte_fbk_hash_lookup_with_bucket(const struct rte_fbk_hash_table *ht,
  * @return
  *   The value that was associated with the key, or negative value on error.
  */
-static inline int
-rte_fbk_hash_lookup(const struct rte_fbk_hash_table *ht, uint32_t key)
+static inline uint64_t
+rte_fbk_hash_lookup(const struct rte_fbk_hash_table *ht, struct rte_fbk_key key, uint64_t *value)
+{
+        RTE_LOG(ERR, HASH, "Look up without providing hash is not implemented yet!");
+	return rte_fbk_hash_lookup_with_bucket(ht,
+				key, rte_fbk_hash_get_bucket(ht, key), value);
+}
+
+static inline uint64_t
+rte_fbk_hash_lookup_with_hash(const struct rte_fbk_hash_table *ht, struct rte_fbk_key key, uint32_t hash, uint64_t *value)
 {
 	return rte_fbk_hash_lookup_with_bucket(ht,
-				key, rte_fbk_hash_get_bucket(ht, key));
+				key, rte_fbk_hash_get_bucket_with_hash(ht, hash), value);
+}
+
+static inline void
+rte_fbk_hash_prefetch_with_hash(const struct rte_fbk_hash_table *ht, uint32_t hash, uint8_t count){
+	uint32_t bucket_id = rte_fbk_hash_get_bucket_with_hash(ht, hash);
+	struct rte_fbk_bucket *prim_bkt = &ht->buckets[bucket_id];
+	for (int i=0; i<count; i++){
+		rte_prefetch0(prim_bkt + i);
+	}
 }
 
 /**
@@ -291,8 +356,9 @@ rte_fbk_hash_lookup(const struct rte_fbk_hash_table *ht, uint32_t key)
 static inline void
 rte_fbk_hash_clear_all(struct rte_fbk_hash_table *ht)
 {
-	memset(ht->t, 0, sizeof(ht->t[0]) * ht->entries);
-	ht->used_entries = 0;
+	RTE_LOG(ERR, HASH, "Function is not implemented yet!");
+//	memset(ht->t, 0, sizeof(ht->t[0]) * ht->entries);
+//	ht->used_entries = 0;
 }
 
 /**

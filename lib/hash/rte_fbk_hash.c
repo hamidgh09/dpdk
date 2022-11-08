@@ -80,16 +80,15 @@ rte_fbk_hash_create(const struct rte_fbk_hash_params *params)
 {
 	struct rte_fbk_hash_table *ht = NULL;
 	struct rte_tailq_entry *te;
+	struct rte_fbk_bucket *buckets;
 	char hash_name[RTE_FBK_HASH_NAMESIZE];
-	const uint32_t mem_size =
-			sizeof(*ht) + (sizeof(ht->t[0]) * params->entries);
 	uint32_t i;
 	struct rte_fbk_hash_list *fbk_hash_list;
 	rte_fbk_hash_fn default_hash_func = (rte_fbk_hash_fn)rte_jhash_1word;
 
 	fbk_hash_list = RTE_TAILQ_CAST(rte_fbk_hash_tailq.head,
 				       rte_fbk_hash_list);
-
+    	RTE_LOG(DEBUG, HASH, "Check parameters: %d, %d, %d, %d", params->entries, params->entries_per_bucket, RTE_FBK_HASH_ENTRIES_MAX, RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX);
 	/* Error checking of parameters. */
 	if ((!rte_is_power_of_2(params->entries)) ||
 			(!rte_is_power_of_2(params->entries_per_bucket)) ||
@@ -98,6 +97,7 @@ rte_fbk_hash_create(const struct rte_fbk_hash_params *params)
 			(params->entries_per_bucket > params->entries) ||
 			(params->entries > RTE_FBK_HASH_ENTRIES_MAX) ||
 			(params->entries_per_bucket > RTE_FBK_HASH_ENTRIES_PER_BUCKET_MAX)){
+		RTE_LOG(ERR, HASH, "Invalid argument for creating hash table!");
 		rte_errno = EINVAL;
 		return NULL;
 	}
@@ -125,7 +125,7 @@ rte_fbk_hash_create(const struct rte_fbk_hash_params *params)
 	}
 
 	/* Allocate memory for table. */
-	ht = rte_zmalloc_socket(hash_name, mem_size,
+	ht = rte_zmalloc_socket(hash_name, sizeof(struct rte_fbk_hash_table),
 			0, params->socket_id);
 	if (ht == NULL) {
 		RTE_LOG(ERR, HASH, "Failed to allocate fbk hash table\n");
@@ -142,7 +142,12 @@ rte_fbk_hash_create(const struct rte_fbk_hash_params *params)
 #endif
 
 	/* Set up hash table context. */
+
+	const uint32_t num_buckets = RTE_MAX(65536u , rte_align32pow2(params->entries) / params->entries_per_bucket);
+	buckets = rte_zmalloc_socket(NULL, num_buckets * sizeof(struct rte_fbk_bucket), RTE_CACHE_LINE_SIZE, params->socket_id);
+
 	strlcpy(ht->name, params->name, sizeof(ht->name));
+	ht->buckets = buckets;
 	ht->entries = params->entries;
 	ht->entries_per_bucket = params->entries_per_bucket;
 	ht->used_entries = 0;
@@ -206,6 +211,7 @@ rte_fbk_hash_free(struct rte_fbk_hash_table *ht)
 
 	rte_mcfg_tailq_write_unlock();
 
+	rte_free(ht->buckets);
 	rte_free(ht);
 	rte_free(te);
 }
